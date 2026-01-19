@@ -1,0 +1,6 @@
+telegram_token: "8592588187:AAGOqcnsIwH1B-MI8TgJHBCRQ2apltX1IVo"
+owner_chat_id: 8181840731
+league: "ENG-Premier League"
+data_cache: "./data"
+model_path: "./model.pkl"
+

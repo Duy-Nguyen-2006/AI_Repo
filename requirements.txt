@@ -1,0 +1,8 @@
+soccerdata==1.8.7
+numpy
+pandas
+pyyaml
+requests
+python-dateutil
+scipy
+
