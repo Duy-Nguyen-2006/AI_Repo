@@ -1,5 +1,5 @@
 import os
-import pickle
+import joblib
 import numpy as np
 import pandas as pd
 from scipy.stats import poisson
@@ -60,6 +60,68 @@ def train_baseline(schedule_df, out_path="./model.pkl"):
         pickle.dump(model, f)
     return out_path
 
+        home_form_points.append(get_form(ht))
+        away_form_points.append(get_form(at))
+        home_avg_goals.append(get_avg(ht, 'goals_for'))
+        away_avg_goals.append(get_avg(at, 'goals_for'))
+
+        # Update stats AFTER the match (for future matches)
+        if hg > ag:
+            hp, ap = 3, 0
+        elif hg == ag:
+            hp, ap = 1, 1
+        else:
+            hp, ap = 0, 3
+
+        stats[ht]['points'].append(hp)
+        stats[ht]['goals_for'].append(hg)
+        stats[ht]['goals_against'].append(ag)
+
+        stats[at]['points'].append(ap)
+        stats[at]['goals_for'].append(ag)
+        stats[at]['goals_against'].append(hg)
+
+    df_train['home_form'] = home_form_points
+    df_train['away_form'] = away_form_points
+    df_train['home_goals_avg'] = home_avg_goals
+    df_train['away_goals_avg'] = away_avg_goals
+
+    feature_cols = ['home_code', 'away_code', 'home_form', 'away_form', 'home_goals_avg', 'away_goals_avg']
+
+    return df_train, feature_cols, le, stats
+
+def train_model(schedule_df, out_path="./model.pkl"):
+    print(f"Training on {len(schedule_df)} matches...")
+    df_train, feature_cols, le, current_stats = prepare_features(schedule_df)
+
+    X = df_train[feature_cols]
+    y = df_train['target']
+
+    # Split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Train
+    clf = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=10)
+    clf.fit(X_train, y_train)
+
+    # Evaluate
+    preds = clf.predict(X_test)
+    acc = accuracy_score(y_test, preds)
+    print(f"Model Accuracy: {acc:.2%}")
+    print(classification_report(y_test, preds))
+
+    # Save everything needed for prediction
+    model_data = {
+        "model": clf,
+        "encoder": le,
+        "stats": current_stats, # Saved to calculate features for next match
+        "feature_cols": feature_cols,
+        "accuracy": acc
+    }
+
+    joblib.dump(model_data, out_path)
+    print(f"Model saved to {out_path}")
+    return out_path
 
 def load_model(path="./model.pkl"):
     if not os.path.exists(path):
