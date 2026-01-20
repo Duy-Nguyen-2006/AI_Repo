@@ -2,89 +2,63 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
+from scipy.stats import poisson
 
-def prepare_features(schedule_df):
-    """
-    Convert raw schedule DataFrame into features for ML.
-    """
-    df = schedule_df.copy()
 
-    # Reset index if it's multi-index to flatten it
-    if isinstance(df.index, pd.MultiIndex):
-        df = df.reset_index()
+def train_baseline(schedule_df, out_path="./model.pkl"):
+    # Simple home/away attack-defense rates from historical matches in schedule_df
+    # Expects schedule_df with columns: home_team, away_team, home_goals, away_goals
 
-    # Standardize column names
-    # soccerdata typically uses 'home_team', 'away_team', 'home_score', 'away_score'
-    # But sometimes 'home_goals', 'away_goals' might be present from other sources.
-    if 'home_score' in df.columns and 'home_goals' not in df.columns:
-        df.rename(columns={'home_score': 'home_goals', 'away_score': 'away_goals'}, inplace=True)
+    # Vectorized optimization:
+    # 1. Convert columns to numeric, filling NaN with 0
+    # 2. GroupBy home/away to aggregate stats
+    # 3. Combine results
 
-    # Drop rows where scores are NaN (future matches) for training
-    df_train = df.dropna(subset=['home_goals', 'away_goals']).copy()
+    # Work on a copy to avoid mutating the input DataFrame
+    df_work = schedule_df.copy()
 
-    # Create target: 0=Away, 1=Draw, 2=Home
-    conditions = [
-        (df_train['home_goals'] > df_train['away_goals']),
-        (df_train['home_goals'] == df_train['away_goals']),
-        (df_train['home_goals'] < df_train['away_goals'])
-    ]
-    choices = [2, 1, 0] # Home Win, Draw, Away Win
-    df_train['target'] = np.select(conditions, choices)
+    # Ensure goals are numeric
+    df_work["home_goals"] = pd.to_numeric(df_work["home_goals"], errors="coerce").fillna(0).astype(int)
+    df_work["away_goals"] = pd.to_numeric(df_work["away_goals"], errors="coerce").fillna(0).astype(int)
 
-    # Encode teams
-    le = LabelEncoder()
-    # Fit on all unique teams in the full dataframe (including future matches)
-    all_teams = pd.concat([df['home_team'], df['away_team']]).unique()
-    le.fit(all_teams)
+    # Home stats: goals scored (for), goals conceded (against), matches played
+    home_stats = df_work.groupby("home_team").agg(
+        goals_for=("home_goals", "sum"),
+        goals_against=("away_goals", "sum"),
+        played=("home_team", "count")
+    )
 
-    df_train['home_code'] = le.transform(df_train['home_team'])
-    df_train['away_code'] = le.transform(df_train['away_team'])
+    # Away stats: goals scored (for), goals conceded (against), matches played
+    away_stats = df_work.groupby("away_team").agg(
+        goals_for=("away_goals", "sum"),
+        goals_against=("home_goals", "sum"),
+        played=("away_team", "count")
+    )
 
-    # --- Feature Engineering: Recent Form ---
-    # We need to calculate this carefully so we don't leak future data.
-    # We will calculate rolling stats based on the date.
+    # Combine home and away stats
+    # We use add(..., fill_value=0) to handle teams that might have only played home or away
+    total_stats = home_stats.add(away_stats, fill_value=0)
 
-    # Ensure date is datetime
-    if 'date' in df_train.columns:
-        df_train['date'] = pd.to_datetime(df_train['date'])
-        df_train = df_train.sort_values('date')
+    # Rename columns to match expected output
+    # The previous loop created keys "for", "against", "played"
+    total_stats = total_stats.rename(columns={"goals_for": "for", "goals_against": "against"})
 
-    # Calculate simple rolling averages for goals and points
-    # This is a simplified approach. A more robust one iterates through matches.
+    df = total_stats
 
-    stats = {} # team -> list of match stats
+    # Avoid division by zero
+    df["avg_for"] = df["for"] / df["played"].replace(0, 1)
+    df["avg_against"] = df["against"] / df["played"].replace(0, 1)
 
-    home_form_points = []
-    away_form_points = []
-    home_avg_goals = []
-    away_avg_goals = []
+    # global average
+    gavg = df["avg_for"].mean()
 
-    # Initialize stats for all teams
-    for team in all_teams:
-        stats[team] = {
-            'points': [],
-            'goals_for': [],
-            'goals_against': []
-        }
+    # Convert to dictionary with "teams" key
+    # The previous code used orient="index" which creates a dict of dicts: {team: {for: ..., against: ...}}
+    model = {"teams": df.to_dict(orient="index"), "global_avg": float(gavg)}
 
-    for idx, row in df_train.iterrows():
-        ht = row['home_team']
-        at = row['away_team']
-        hg = row['home_goals']
-        ag = row['away_goals']
-
-        # Get pre-match stats (last 5 games)
-        def get_avg(team, metric):
-            l = stats[team][metric]
-            return np.mean(l[-5:]) if len(l) > 0 else 0.0
-
-        def get_form(team):
-            l = stats[team]['points']
-            return sum(l[-5:]) if len(l) > 0 else 0
+    with open(out_path, "wb") as f:
+        pickle.dump(model, f)
+    return out_path
 
         home_form_points.append(get_form(ht))
         away_form_points.append(get_form(at))
@@ -152,4 +126,26 @@ def train_model(schedule_df, out_path="./model.pkl"):
 def load_model(path="./model.pkl"):
     if not os.path.exists(path):
         raise FileNotFoundError(path)
-    return joblib.load(path)
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def predict_score(home, away, model, home_adv=1.1, max_goals=6):
+    teams = model["teams"]
+    gavg = model["global_avg"]
+    home_attack = teams.get(home, {}).get("avg_for", gavg)
+    home_def = teams.get(home, {}).get("avg_against", gavg)
+    away_attack = teams.get(away, {}).get("avg_for", gavg)
+    away_def = teams.get(away, {}).get("avg_against", gavg)
+    exp_home = max(0.01, home_attack * (away_def / max(1e-3, gavg)) * home_adv)
+    exp_away = max(0.01, away_attack * (home_def / max(1e-3, gavg)))
+    # compute most likely score via Poisson probabilities
+    best = None
+    bestp = 0.0
+    for h in range(0, max_goals + 1):
+        for a in range(0, max_goals + 1):
+            p = poisson.pmf(h, exp_home) * poisson.pmf(a, exp_away)
+            if p > bestp:
+                bestp = p
+                best = (h, a, p)
+    return {"home_exp": exp_home, "away_exp": exp_away, "predicted": best}
