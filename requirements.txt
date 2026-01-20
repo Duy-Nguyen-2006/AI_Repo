@@ -6,3 +6,7 @@ requests
 python-dateutil
 scipy
 
+scikit-learn
+joblib
+pyarrow
+setuptools
