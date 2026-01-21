@@ -3,6 +3,10 @@ import joblib
 import numpy as np
 import pandas as pd
 from scipy.stats import poisson
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
 
 
 def train_baseline(schedule_df, out_path="./model.pkl"):
@@ -57,38 +61,101 @@ def train_baseline(schedule_df, out_path="./model.pkl"):
     model = {"teams": df.to_dict(orient="index"), "global_avg": float(gavg)}
 
     with open(out_path, "wb") as f:
-        pickle.dump(model, f)
+        joblib.dump(model, f)
     return out_path
 
-        home_form_points.append(get_form(ht))
-        away_form_points.append(get_form(at))
-        home_avg_goals.append(get_avg(ht, 'goals_for'))
-        away_avg_goals.append(get_avg(at, 'goals_for'))
 
-        # Update stats AFTER the match (for future matches)
-        if hg > ag:
-            hp, ap = 3, 0
-        elif hg == ag:
-            hp, ap = 1, 1
-        else:
-            hp, ap = 0, 3
+def prepare_features(schedule_df):
+    """
+    Vectorized Feature Engineering
+    Calculates rolling form and average goals for home and away teams.
+    """
+    df = schedule_df.copy()
 
-        stats[ht]['points'].append(hp)
-        stats[ht]['goals_for'].append(hg)
-        stats[ht]['goals_against'].append(ag)
+    # Ensure date is datetime
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date')
 
-        stats[at]['points'].append(ap)
-        stats[at]['goals_for'].append(ag)
-        stats[at]['goals_against'].append(hg)
+    # Label Encode Teams
+    le = LabelEncoder()
+    # Fit on all unique teams
+    all_teams = pd.concat([df['home_team'], df['away_team']]).unique()
+    le.fit(all_teams)
 
-    df_train['home_form'] = home_form_points
-    df_train['away_form'] = away_form_points
-    df_train['home_goals_avg'] = home_avg_goals
-    df_train['away_goals_avg'] = away_avg_goals
+    df['home_code'] = le.transform(df['home_team'])
+    df['away_code'] = le.transform(df['away_team'])
+
+    # Calculate Points and Result
+    # 0: Away Win, 1: Draw, 2: Home Win
+    # Convert goals to numeric first
+    df['home_goals'] = pd.to_numeric(df['home_goals'], errors='coerce').fillna(0)
+    df['away_goals'] = pd.to_numeric(df['away_goals'], errors='coerce').fillna(0)
+
+    conditions = [
+        (df['home_goals'] > df['away_goals']),
+        (df['home_goals'] == df['away_goals']),
+        (df['home_goals'] < df['away_goals'])
+    ]
+    values = [2, 1, 0]
+    df['target'] = np.select(conditions, values)
+
+    home_points = np.select(conditions, [3, 1, 0])
+    away_points = np.select(conditions, [0, 1, 3])
+
+    # Create Long Format for Feature Engineering
+    home_df = df[['date', 'home_team', 'home_goals', 'away_goals']].copy()
+    home_df.columns = ['date', 'team', 'goals_for', 'goals_against']
+    home_df['points'] = home_points
+    home_df['is_home'] = True
+    home_df['match_index'] = df.index
+
+    away_df = df[['date', 'away_team', 'away_goals', 'home_goals']].copy()
+    away_df.columns = ['date', 'team', 'goals_for', 'goals_against']
+    away_df['points'] = away_points
+    away_df['is_home'] = False
+    away_df['match_index'] = df.index
+
+    # Sort by date for rolling calc
+    long_df = pd.concat([home_df, away_df]).sort_values(['date'])
+
+    # Group by team and calculate rolling features
+    grouped = long_df.groupby('team')
+
+    # Rolling sum of points (Form) - Shift 1 to use past data only
+    long_df['form'] = grouped['points'].transform(lambda x: x.shift(1).rolling(5, min_periods=1).sum().fillna(0))
+
+    # Rolling mean of goals_for (Avg Goals) - Shift 1 to use past data only
+    long_df['goals_avg'] = grouped['goals_for'].transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean().fillna(0))
+
+    # Restore original index order to map back correctly
+    # Note: merge operations might change order, so using match_index is safer
+
+    home_features = long_df[long_df['is_home']].set_index('match_index')[['form', 'goals_avg']]
+    home_features.columns = ['home_form', 'home_goals_avg']
+
+    away_features = long_df[~long_df['is_home']].set_index('match_index')[['form', 'goals_avg']]
+    away_features.columns = ['away_form', 'away_goals_avg']
+
+    # Join features back to main df
+    df = df.join(home_features).join(away_features)
+
+    # Fill remaining NaNs (start of season)
+    df = df.fillna(0)
+
+    # Create Stats Dict for Predict (Full history for each team)
+    stats = {}
+    for team, group in long_df.groupby('team'):
+        stats[team] = {
+            'points': group['points'].tolist(),
+            'goals_for': group['goals_for'].tolist(),
+            'goals_against': group['goals_against'].tolist()
+        }
 
     feature_cols = ['home_code', 'away_code', 'home_form', 'away_form', 'home_goals_avg', 'away_goals_avg']
 
-    return df_train, feature_cols, le, stats
+    return df, feature_cols, le, stats
+
 
 def train_model(schedule_df, out_path="./model.pkl"):
     print(f"Training on {len(schedule_df)} matches...")
@@ -123,14 +190,15 @@ def train_model(schedule_df, out_path="./model.pkl"):
     print(f"Model saved to {out_path}")
     return out_path
 
+
 def load_model(path="./model.pkl"):
     if not os.path.exists(path):
         raise FileNotFoundError(path)
-    with open(path, "rb") as f:
-        return pickle.load(f)
+    return joblib.load(path)
 
 
 def predict_score(home, away, model, home_adv=1.1, max_goals=6):
+    # This seems to be for the baseline model, but included for compatibility if needed.
     teams = model["teams"]
     gavg = model["global_avg"]
     home_attack = teams.get(home, {}).get("avg_for", gavg)
