@@ -3,7 +3,10 @@ import joblib
 import numpy as np
 import pandas as pd
 from scipy.stats import poisson
-
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.preprocessing import LabelEncoder
 
 def train_baseline(schedule_df, out_path="./model.pkl"):
     # Simple home/away attack-defense rates from historical matches in schedule_df
@@ -40,7 +43,6 @@ def train_baseline(schedule_df, out_path="./model.pkl"):
     total_stats = home_stats.add(away_stats, fill_value=0)
 
     # Rename columns to match expected output
-    # The previous loop created keys "for", "against", "played"
     total_stats = total_stats.rename(columns={"goals_for": "for", "goals_against": "against"})
 
     df = total_stats
@@ -53,42 +55,93 @@ def train_baseline(schedule_df, out_path="./model.pkl"):
     gavg = df["avg_for"].mean()
 
     # Convert to dictionary with "teams" key
-    # The previous code used orient="index" which creates a dict of dicts: {team: {for: ..., against: ...}}
     model = {"teams": df.to_dict(orient="index"), "global_avg": float(gavg)}
 
-    with open(out_path, "wb") as f:
-        pickle.dump(model, f)
+    joblib.dump(model, out_path)
     return out_path
 
-        home_form_points.append(get_form(ht))
-        away_form_points.append(get_form(at))
-        home_avg_goals.append(get_avg(ht, 'goals_for'))
-        away_avg_goals.append(get_avg(at, 'goals_for'))
 
-        # Update stats AFTER the match (for future matches)
-        if hg > ag:
-            hp, ap = 3, 0
-        elif hg == ag:
-            hp, ap = 1, 1
-        else:
-            hp, ap = 0, 3
+def prepare_features(schedule_df):
+    """
+    Optimized feature engineering using vectorized operations.
+    Replaces the O(N) iterative loop with Pandas vectorized operations.
+    """
+    df = schedule_df.copy()
 
-        stats[ht]['points'].append(hp)
-        stats[ht]['goals_for'].append(hg)
-        stats[ht]['goals_against'].append(ag)
+    # Ensure date is sorted
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
 
-        stats[at]['points'].append(ap)
-        stats[at]['goals_for'].append(ag)
-        stats[at]['goals_against'].append(hg)
+    # Label encoding
+    le = LabelEncoder()
+    all_teams = pd.concat([df['home_team'], df['away_team']]).unique()
+    le.fit(all_teams)
 
-    df_train['home_form'] = home_form_points
-    df_train['away_form'] = away_form_points
-    df_train['home_goals_avg'] = home_avg_goals
-    df_train['away_goals_avg'] = away_avg_goals
+    df['home_code'] = le.transform(df['home_team'])
+    df['away_code'] = le.transform(df['away_team'])
+
+    # Target: 0: Away Win, 1: Draw, 2: Home Win
+    conditions = [
+        (df['home_goals'] > df['away_goals']),
+        (df['home_goals'] == df['away_goals']),
+        (df['home_goals'] < df['away_goals'])
+    ]
+    choices = [2, 1, 0]
+    df['target'] = np.select(conditions, choices)
+
+    # Vectorized Rolling Stats Calculation
+    # 1. Melt/Stack to get a long DataFrame: [date, team, goals_for, goals_against, points]
+
+    # Home perspective
+    home_df = df[['date', 'home_team', 'home_goals', 'away_goals']].copy()
+    home_df.columns = ['date', 'team', 'goals_for', 'goals_against']
+    home_df['points'] = np.where(home_df['goals_for'] > home_df['goals_against'], 3,
+                                 np.where(home_df['goals_for'] == home_df['goals_against'], 1, 0))
+    home_df['is_home'] = True
+    home_df['match_index'] = home_df.index # Keep original index to join back
+
+    # Away perspective
+    away_df = df[['date', 'away_team', 'away_goals', 'home_goals']].copy()
+    away_df.columns = ['date', 'team', 'goals_for', 'goals_against']
+    away_df['points'] = np.where(away_df['goals_for'] > away_df['goals_against'], 3,
+                                 np.where(away_df['goals_for'] == away_df['goals_against'], 1, 0))
+    away_df['is_home'] = False
+    away_df['match_index'] = away_df.index
+
+    # Concatenate
+    long_df = pd.concat([home_df, away_df], ignore_index=True)
+
+    # Sort by team and date to ensure rolling window is correct chronologically
+    long_df = long_df.sort_values(['team', 'date'])
+
+    # Calculate rolling stats
+    # shift(1) ensures we don't include the current match in the stats
+    grouped = long_df.groupby('team')
+
+    long_df['form'] = grouped['points'].transform(lambda x: x.shift(1).rolling(window=5, min_periods=1).sum()).fillna(0)
+    long_df['avg_goals'] = grouped['goals_for'].transform(lambda x: x.shift(1).rolling(window=5, min_periods=1).mean()).fillna(0)
+
+    # Now map these back to the original dataframe
+    home_stats = long_df[long_df['is_home']].set_index('match_index')[['form', 'avg_goals']]
+    home_stats.columns = ['home_form', 'home_goals_avg']
+
+    away_stats = long_df[~long_df['is_home']].set_index('match_index')[['form', 'avg_goals']]
+    away_stats.columns = ['away_form', 'away_goals_avg']
+
+    df = df.join(home_stats).join(away_stats)
 
     feature_cols = ['home_code', 'away_code', 'home_form', 'away_form', 'home_goals_avg', 'away_goals_avg']
 
-    return df_train, feature_cols, le, stats
+    # Prepare stats dictionary for export (needed for predict.py)
+    stats = {}
+    for team, group in long_df.groupby('team'):
+        stats[team] = {
+            'points': group['points'].tolist(),
+            'goals_for': group['goals_for'].tolist(),
+            'goals_against': group['goals_against'].tolist()
+        }
+
+    return df, feature_cols, le, stats
 
 def train_model(schedule_df, out_path="./model.pkl"):
     print(f"Training on {len(schedule_df)} matches...")
@@ -126,8 +179,7 @@ def train_model(schedule_df, out_path="./model.pkl"):
 def load_model(path="./model.pkl"):
     if not os.path.exists(path):
         raise FileNotFoundError(path)
-    with open(path, "rb") as f:
-        return pickle.load(f)
+    return joblib.load(path)
 
 
 def predict_score(home, away, model, home_adv=1.1, max_goals=6):
