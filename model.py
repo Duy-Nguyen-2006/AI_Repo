@@ -1,8 +1,13 @@
 import os
 import joblib
+import pickle
 import numpy as np
 import pandas as pd
 from scipy.stats import poisson
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.preprocessing import LabelEncoder
 
 
 def train_baseline(schedule_df, out_path="./model.pkl"):
@@ -60,35 +65,109 @@ def train_baseline(schedule_df, out_path="./model.pkl"):
         pickle.dump(model, f)
     return out_path
 
-        home_form_points.append(get_form(ht))
-        away_form_points.append(get_form(at))
-        home_avg_goals.append(get_avg(ht, 'goals_for'))
-        away_avg_goals.append(get_avg(at, 'goals_for'))
 
-        # Update stats AFTER the match (for future matches)
-        if hg > ag:
-            hp, ap = 3, 0
-        elif hg == ag:
-            hp, ap = 1, 1
-        else:
-            hp, ap = 0, 3
+def prepare_features(schedule_df):
+    # Ensure date is datetime
+    schedule_df = schedule_df.copy()
+    schedule_df['date'] = pd.to_datetime(schedule_df['date'])
+    schedule_df = schedule_df.sort_values('date')
 
-        stats[ht]['points'].append(hp)
-        stats[ht]['goals_for'].append(hg)
-        stats[ht]['goals_against'].append(ag)
+    # Label Encode Teams
+    le = LabelEncoder()
+    # Fit on all unique teams in home and away columns
+    all_teams = pd.unique(pd.concat([schedule_df['home_team'], schedule_df['away_team']]))
+    le.fit(all_teams)
 
-        stats[at]['points'].append(ap)
-        stats[at]['goals_for'].append(ag)
-        stats[at]['goals_against'].append(hg)
+    schedule_df['home_code'] = le.transform(schedule_df['home_team'])
+    schedule_df['away_code'] = le.transform(schedule_df['away_team'])
 
-    df_train['home_form'] = home_form_points
-    df_train['away_form'] = away_form_points
-    df_train['home_goals_avg'] = home_avg_goals
-    df_train['away_goals_avg'] = away_avg_goals
+    # Determine match results and points
+    # Target: 0=Away Win, 1=Draw, 2=Home Win
+    conditions = [
+        schedule_df['home_goals'] > schedule_df['away_goals'],
+        schedule_df['home_goals'] == schedule_df['away_goals'],
+        schedule_df['home_goals'] < schedule_df['away_goals']
+    ]
+    choices = [2, 1, 0]
+    schedule_df['target'] = np.select(conditions, choices)
+
+    # Points for home and away
+    # Home: Win=3, Draw=1, Loss=0
+    home_points = np.select(conditions, [3, 1, 0])
+    # Away: Win=0, Draw=1, Loss=3 (relative to home result)
+    # Wait, if Home Win (idx 0), Away gets 0. If Draw (idx 1), Away gets 1. If Home Loss (idx 2), Away Win, so 3.
+    away_points = np.select(conditions, [0, 1, 3])
+
+    # Create Long Format for Rolling Stats
+    # We want two rows per match: one for home team perspective, one for away team perspective
+
+    home_df = schedule_df[['date', 'home_team', 'home_goals', 'away_goals']].copy()
+    home_df.columns = ['date', 'team', 'goals_for', 'goals_against']
+    home_df['points'] = home_points
+
+    away_df = schedule_df[['date', 'away_team', 'away_goals', 'home_goals']].copy()
+    away_df.columns = ['date', 'team', 'goals_for', 'goals_against']
+    away_df['points'] = away_points
+
+    # Combine and sort by team then date to ensure rolling works correctly
+    long_df = pd.concat([home_df, away_df], ignore_index=True)
+    long_df = long_df.sort_values(['team', 'date'])
+
+    # Calculate Rolling Features (shifted by 1 to prevent leakage)
+    grouped = long_df.groupby('team')
+
+    # Form: Sum of points in last 5 games
+    # shift(1) means the value at index i is the sum of i-5...i-1.
+    # i.e. stats BEFORE the current match.
+    long_df['form'] = grouped['points'].transform(
+        lambda x: x.rolling(window=5, min_periods=1).sum().shift(1).fillna(0)
+    )
+
+    # Avg Goals: Mean of goals_for in last 5 games
+    long_df['goals_avg'] = grouped['goals_for'].transform(
+        lambda x: x.rolling(window=5, min_periods=1).mean().shift(1).fillna(0)
+    )
+
+    # Now merge these stats back to the original schedule_df.
+    # We need to map back based on team and date.
+
+    # Since we have duplicate dates potentially (though rare for same team), but 'team' + 'date' should be unique per match per team.
+
+    # Create temp dfs for merging
+    # Home stats
+    feat_home = long_df[['date', 'team', 'form', 'goals_avg']].rename(columns={
+        'team': 'home_team',
+        'form': 'home_form',
+        'goals_avg': 'home_goals_avg'
+    })
+
+    # Away stats
+    feat_away = long_df[['date', 'team', 'form', 'goals_avg']].rename(columns={
+        'team': 'away_team',
+        'form': 'away_form',
+        'goals_avg': 'away_goals_avg'
+    })
+
+    # Merge
+    # We use left join to keep all matches in schedule_df
+    df_train = pd.merge(schedule_df, feat_home, on=['date', 'home_team'], how='left')
+    df_train = pd.merge(df_train, feat_away, on=['date', 'away_team'], how='left')
 
     feature_cols = ['home_code', 'away_code', 'home_form', 'away_form', 'home_goals_avg', 'away_goals_avg']
 
+    # Reconstruct stats dictionary for predict.py
+    # predict.py needs the full history to calculate stats for the NEXT match.
+    # So we give it the lists from long_df.
+    stats = {}
+    for team, group in long_df.groupby('team'):
+        stats[team] = {
+            'points': group['points'].tolist(),
+            'goals_for': group['goals_for'].tolist(),
+            'goals_against': group['goals_against'].tolist()
+        }
+
     return df_train, feature_cols, le, stats
+
 
 def train_model(schedule_df, out_path="./model.pkl"):
     print(f"Training on {len(schedule_df)} matches...")
@@ -123,11 +202,18 @@ def train_model(schedule_df, out_path="./model.pkl"):
     print(f"Model saved to {out_path}")
     return out_path
 
+
 def load_model(path="./model.pkl"):
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     with open(path, "rb") as f:
-        return pickle.load(f)
+        # Try joblib first since we use it in train_model
+        try:
+            return joblib.load(f)
+        except:
+            # Fallback to pickle for backward compatibility or if joblib fails
+            f.seek(0)
+            return pickle.load(f)
 
 
 def predict_score(home, away, model, home_adv=1.1, max_goals=6):
